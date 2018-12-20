@@ -87,16 +87,19 @@
     -Brian
 */
 
+#include <string>
 #include "sql_class.h"           // MYSQL_HANDLERTON_INTERFACE_VERSION
 #include "ha_rabbit.h"
 #include "probes_mysql.h"
 #include "sql_plugin.h"
+#include "Record.h"
 
 static handler *rabbit_create_handler(handlerton *hton,
                                       TABLE_SHARE *table,
                                       MEM_ROOT *mem_root);
 
 handlerton *rabbit_hton;
+KvStore *kvStore;
 
 /* Interface to mysqld, to check system tables supported by SE */
 static const char* rabbit_system_database();
@@ -120,7 +123,11 @@ static int rabbit_init_func(void *p)
     rabbit_hton->flags=                     HTON_CAN_RECREATE;
     rabbit_hton->system_database=   rabbit_system_database;
     rabbit_hton->is_supported_system_table= rabbit_is_supported_system_table;
-
+    kvStore = new (std::nothrow) KvStore();
+    if (!kvStore) {
+        return true;
+    }
+    kvStore->start();
     DBUG_RETURN(0);
 }
 
@@ -158,12 +165,20 @@ static handler* rabbit_create_handler(handlerton *hton,
                                       TABLE_SHARE *table,
                                       MEM_ROOT *mem_root)
 {
-    return new (mem_root) ha_rabbit(hton, table);
+    return new (mem_root) ha_rabbit(hton, table, kvStore);
 }
 
-ha_rabbit::ha_rabbit(handlerton *hton, TABLE_SHARE *table_arg)
-    :handler(hton, table_arg)
-{}
+ha_rabbit::ha_rabbit(handlerton *hton, TABLE_SHARE *table_arg, KvStore * store)
+    :handler(hton, table_arg), store(store), curKey(KvStore::kBeginKey)
+{
+    if (table_arg && table_arg->db.str && table_arg->table_name.str) {
+        bound = std::string(table_arg->db.str, table_arg->db.length) + "/" +
+                std::string(table_arg->table_name.str, table_arg->table_name.length);
+        std::string tmpKey, tmpVal;
+        // try to add bound for this table, if have existed, ignore it.
+        store->add(bound, "");
+    }
+}
 
 
 /**
@@ -344,7 +359,49 @@ int ha_rabbit::write_row(uchar *buf)
       probably need to do something with 'buf'. We report a success
       here, to pretend that the insert was successful.
     */
-    DBUG_RETURN(0);
+    ha_statistic_increment(&SSV::ha_write_count);
+    bool hasKey = false;
+    Record record;
+    char attribute_buffer[1024];
+    String attribute(attribute_buffer, sizeof(attribute_buffer),
+                     &my_charset_bin);
+    my_bitmap_map *org_bitmap= dbug_tmp_use_all_columns(table, table->read_set);
+    for (Field **field=table->field ; *field ; field++)
+    {
+        //const char *ptr;
+        //const char *end_ptr;
+        const bool was_null = (*field)->is_null();
+        /*
+          assistance for backwards compatibility in production builds.
+          note: this will not work for ENUM columns.
+        */
+        if (was_null)
+        {
+            (*field)->set_default();
+            (*field)->set_notnull();
+        }
+
+        (*field)->val_str(&attribute, &attribute);
+
+        if (was_null)
+            (*field)->set_null();
+
+        std::string col = std::string(attribute.ptr(), attribute.length());
+        if (!hasKey)
+        {
+            record.setKey(bound + '/' + col);
+            hasKey = true;
+        }
+        record.appendCol(col);
+    }
+
+    bool ok = kvStore->add(record.getKey(), record.getFormatedRow());
+    dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+    if (!ok) {
+        DBUG_RETURN(HA_ERR_FOUND_DUPP_KEY);
+    }
+    stats.records++;
+    DBUG_RETURN(!ok);
 }
 
 
@@ -373,9 +430,52 @@ int ha_rabbit::write_row(uchar *buf)
 */
 int ha_rabbit::update_row(const uchar *old_data, uchar *new_data)
 {
-
     DBUG_ENTER("ha_rabbit::update_row");
-    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    ha_statistic_increment(&SSV::ha_update_count);
+    char attribute_buffer[1024];
+    String attribute(attribute_buffer, sizeof(attribute_buffer),
+                     &my_charset_bin);
+    my_bitmap_map *org_bitmap= dbug_tmp_use_all_columns(table, table->read_set);
+    Record record;
+    bool hasKey = false;
+    for (Field **field=table->field ; *field ; field++)
+    {
+        // const char *ptr;
+        //const char *end_ptr;
+        const bool was_null = (*field)->is_null();
+
+        /*
+          assistance for backwards compatibility in production builds.
+          note: this will not work for ENUM columns.
+        */
+        if (was_null)
+        {
+            (*field)->set_default();
+            (*field)->set_notnull();
+        }
+
+        (*field)->val_str(&attribute, &attribute);
+
+        if (was_null)
+            (*field)->set_null();
+
+        std::string col = std::string(attribute.ptr(), attribute.length());
+        if (!hasKey)
+        {
+            record.setKey(bound + '/' + col);
+            hasKey = true;
+        }
+        record.appendCol(col);
+    }
+
+    bool delOk = kvStore->del(curKey);
+    bool addOK = kvStore->add(record.getKey(), record.getFormatedRow());
+    dbug_tmp_restore_column_map(table->read_set, org_bitmap);
+    if (!addOK || !delOk)
+    {
+        DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
+    }
+    DBUG_RETURN(0);
 }
 
 
@@ -402,7 +502,13 @@ int ha_rabbit::update_row(const uchar *old_data, uchar *new_data)
 int ha_rabbit::delete_row(const uchar *buf)
 {
     DBUG_ENTER("ha_rabbit::delete_row");
-    DBUG_RETURN(HA_ERR_WRONG_COMMAND);
+    ha_statistic_increment(&SSV::ha_delete_count);
+    bool ok = kvStore->del(curKey);
+    if (!ok)
+    {
+        DBUG_RETURN(HA_ERR_KEY_NOT_FOUND);
+    }
+    DBUG_RETURN(0);
 }
 
 
@@ -517,6 +623,7 @@ int ha_rabbit::index_last(uchar *buf)
 int ha_rabbit::rnd_init(bool scan)
 {
     DBUG_ENTER("ha_rabbit::rnd_init");
+    curKey = bound;
     DBUG_RETURN(0);
 }
 
@@ -543,11 +650,63 @@ int ha_rabbit::rnd_end()
 */
 int ha_rabbit::rnd_next(uchar *buf)
 {
-    int rc;
+    int rc = 0;
     DBUG_ENTER("ha_rabbit::rnd_next");
     MYSQL_READ_ROW_START(table_share->db.str, table_share->table_name.str,
                          TRUE);
-    rc= HA_ERR_END_OF_FILE;
+    ha_statistic_increment(&SSV::ha_read_rnd_next_count);
+    bool read_all;
+    my_bitmap_map *org_bitmap;
+    std::string nextKey;
+    std::string val;
+    /* We must read all columns in case a table is opened for update */
+    read_all= !bitmap_is_clear_all(table->write_set);
+    /* Avoid asserts in ::store() for columns that are not going to be updated */
+    memset(buf, 0, table->s->null_bytes);
+    org_bitmap= dbug_tmp_use_all_columns(table, table->write_set);
+    if (!kvStore->next(curKey, nextKey, val)) {
+        dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+        rc = HA_ERR_INTERNAL_ERROR;
+        MYSQL_READ_ROW_DONE(rc);
+        DBUG_RETURN(rc);
+    }
+
+    if (nextKey == KvStore::kEndKey || !belongToMe(nextKey)) {
+        dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+        rc = HA_ERR_END_OF_FILE;
+        MYSQL_READ_ROW_DONE(rc);
+        DBUG_RETURN(rc);
+    }
+    curKey = nextKey;
+    Record record;
+    if (!record.parseFromFormatedRow(val)) {
+        dbug_tmp_restore_column_map(table->write_set, org_bitmap);
+        rc = HA_ERR_INTERNAL_ERROR;
+        MYSQL_READ_ROW_DONE(rc);
+        DBUG_RETURN(rc);
+    }
+
+    std::vector<std::string> cols = record.getCols();
+    int n = 0;
+    for (Field ** field = table->field; *field; field++) {
+        buffer.length(0);
+        std::string col = cols[n++];
+        if (read_all || bitmap_is_set(table->read_set, (*field)->field_index)) {
+            for (size_t i = 0; i < col.size(); i++) {
+                buffer.append(col[i]);
+            }
+            bool is_enum= ((*field)->real_type() ==  MYSQL_TYPE_ENUM);
+            if ((*field)->store(buffer.ptr(), buffer.length(), buffer.charset(),
+                                is_enum ? CHECK_FIELD_IGNORE : CHECK_FIELD_WARN)) {
+                if (!is_enum) {
+                    rc = HA_ERR_INTERNAL_ERROR;
+                    break;
+                }
+            }
+        }
+    }
+
+    dbug_tmp_restore_column_map(table->write_set, org_bitmap);
     MYSQL_READ_ROW_DONE(rc);
     DBUG_RETURN(rc);
 }
@@ -884,9 +1043,15 @@ int ha_rabbit::create(const char *name, TABLE *table_arg,
       This is not implemented but we want someone to be able to see that it
       works.
     */
+    bound = std::string(table_arg->s->db.str, table_arg->s->db.length) + "/" +
+            std::string(table_arg->s->table_name.str, table_arg->s->table_name.length);
     DBUG_RETURN(0);
 }
 
+bool ha_rabbit::belongToMe(const std::string &key) {
+    int ret = strncmp(bound.c_str(), key.c_str(), bound.size());
+    return ret == 0;
+}
 
 struct st_mysql_storage_engine rabbit_storage_engine=
 { MYSQL_HANDLERTON_INTERFACE_VERSION };

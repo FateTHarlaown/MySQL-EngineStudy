@@ -12,11 +12,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
-
+add_definitions(-std=c++11)
 SET(RABBIT_PLUGIN_DYNAMIC "ha_rabbit")
-SET(RABBIT_SOURCES ha_rabbit.cc)
-IF(WITH_RABBIT_STORAGE_ENGINE AND NOT WITHOUT_RABBIT_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(rabbit ${RABBIT_SOURCES} STORAGE_ENGINE DEFAULT)
-ELSEIF(NOT WITHOUT_RABBIT_STORAGE_ENGINE)
-  MYSQL_ADD_PLUGIN(rabbit ${RABBIT_SOURCES} STORAGE_ENGINE MODULE_ONLY)
-ENDIF()
+SET(RABBIT_SOURCES
+        ha_rabbit.cc
+        KvStore.cc
+        Record.cc)
+MYSQL_ADD_PLUGIN(rabbit ${RABBIT_SOURCES} STORAGE_ENGINE DEFAULT)

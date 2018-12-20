@@ -35,6 +35,7 @@
 #include "thr_lock.h"                    /* THR_LOCK, THR_LOCK_DATA */
 #include "handler.h"                     /* handler */
 #include "my_base.h"                     /* ha_rows */
+#include "KvStore.h"
 
 /** @brief
   Rabbit_share is a class that will be shared among all open handlers.
@@ -59,9 +60,15 @@ class ha_rabbit: public handler
     THR_LOCK_DATA lock;      ///< MySQL lock
     Rabbit_share* share;    ///< Shared lock info
     Rabbit_share* get_share(); ///< Get the share
+    String buffer;
+    KvStore * store;
+    std::string curKey;
+    std::string bound;
+private:
+    bool belongToMe(const std::string & key);
 
 public:
-    ha_rabbit(handlerton* hton, TABLE_SHARE* table_arg);
+    ha_rabbit(handlerton* hton, TABLE_SHARE* table_arg, KvStore * store);
     ~ha_rabbit()
     {
     }
