@@ -66,11 +66,12 @@ bool KvStore::next(const std::string &curKey, std::string &nextKey, std::string 
 void KvStore::start() {
     run_ = true;
     worker_ = std::make_shared<std::thread>(std::bind(&KvStore::run, this));
-    worker_->detach();
 }
 
 void KvStore::stop() {
     run_ = false;
+    cond_.notify_one();
+    worker_->join();
 }
 
 bool KvStore::doGet(const std::string &key, std::string &val) {
@@ -131,8 +132,11 @@ void KvStore::run() {
         Task t;
         {
             std::lock_guard<std::mutex> guard(mu_);
-            while (queue_.empty()) {
+            while (run_ && queue_.empty()) {
                 cond_.wait(mu_);
+            }
+            if (!run_) {
+                break;
             }
             t = std::move(queue_.front());
             queue_.pop();
