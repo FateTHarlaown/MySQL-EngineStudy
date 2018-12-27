@@ -14,8 +14,10 @@
 # Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301 USA
 add_definitions(-std=c++11)
 SET(RABBIT_PLUGIN_DYNAMIC "ha_rabbit")
+add_subdirectory(./test)
 SET(RABBIT_SOURCES
         ha_rabbit.cc
         KvStore.cc
         Record.cc)
 MYSQL_ADD_PLUGIN(rabbit ${RABBIT_SOURCES} STORAGE_ENGINE DEFAULT)
+
